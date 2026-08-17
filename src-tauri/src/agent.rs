@@ -116,8 +116,12 @@ impl Agent {
         println!("[agent] run() starting with: {} (provider: {}, model: {}, mode: {:?}, history: {} msgs, screenshot: {}, conv: {:?})",
             instructions, provider, model, mode, history.len(), context_screenshot.is_some(), conversation_id);
 
-        let api_key = self.api_key.clone().ok_or(AgentError::NoApiKey)?;
-        println!("[agent] API key present");
+        // resolve the key for the requested provider from its env var first,
+        // falling back to the key stored via set_api_key (e.g. at startup)
+        let api_key = providers::get_api_key_for_provider(&provider)
+            .or_else(|| self.api_key.clone())
+            .ok_or(AgentError::NoApiKey)?;
+        println!("[agent] API key present (provider: {})", provider);
 
         // init computer control
         println!("[agent] Initializing computer control...");

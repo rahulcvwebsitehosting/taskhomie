@@ -24,7 +24,7 @@ use tauri::{
     tray::TrayIconBuilder,
     Emitter, Manager, PhysicalPosition, State,
 };
-use tauri_plugin_global_shortcut::{Code, Modifiers, Shortcut, ShortcutState};
+use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 
 #[cfg(target_os = "macos")]
 use tauri_nspanel::{
@@ -136,7 +136,13 @@ async fn set_api_key(api_key: String, state: State<'_, AppState>) -> Result<(), 
 #[tauri::command]
 async fn check_api_key(state: State<'_, AppState>) -> Result<bool, String> {
     let agent = state.agent.lock().await;
-    Ok(agent.has_api_key())
+    if agent.has_api_key() {
+        return Ok(true);
+    }
+    // any configured provider key counts as "set"
+    Ok(providers::get_all_providers()
+        .iter()
+        .any(|p| std::env::var(&p.api_key_env).is_ok()))
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -164,7 +170,16 @@ async fn run_agent(
             return Err("Agent is already running".to_string());
         }
         if !agent_guard.has_api_key() {
-            return Err("No API key set. Please add ANTHROPIC_API_KEY to .env".to_string());
+            let provider_key_set = providers::get_api_key_for_provider(&provider).is_some();
+            if !provider_key_set {
+                let env_name = providers::get_provider(&provider)
+                    .map(|p| p.api_key_env.clone())
+                    .unwrap_or_else(|| "ANTHROPIC_API_KEY".to_string());
+                return Err(format!(
+                    "No API key set for provider '{}'. Please add {} to .env or save a key in Settings.",
+                    provider, env_name
+                ));
+            }
         }
     }
 
@@ -575,6 +590,16 @@ fn main() {
     if dotenvy::dotenv().is_err() {
         let _ = dotenvy::from_filename("../.env");
     }
+    // fallback for installed builds: look for .env next to the executable
+    if std::env::var("OPENCODE_ZEN_API_KEY").is_err()
+        && std::env::var("ANTHROPIC_API_KEY").is_err()
+    {
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                let _ = dotenvy::from_path(dir.join(".env"));
+            }
+        }
+    }
 
     // init storage
     if let Err(e) = storage::init_db() {
@@ -584,28 +609,29 @@ fn main() {
     let running = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut agent = Agent::new(running.clone());
 
-    if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
-        println!("[taskhomie] API key loaded");
-        agent.set_api_key(key);
+    // load the first available provider key as a fallback for set_api_key
+    // (run() resolves the per-provider key from env at call time)
+    for provider in providers::get_all_providers() {
+        if let Ok(key) = std::env::var(&provider.api_key_env) {
+            println!("[taskhomie] API key loaded ({})", provider.id);
+            agent.set_api_key(key);
+            break;
+        }
     }
 
     let running_for_shortcut = running.clone();
+
+    // Primary modifier: Cmd on macOS, Ctrl elsewhere (Windows reserves Win+Shift combos
+    // such as Win+Shift+S for the Snip & Sketch tool, which would otherwise crash startup).
+    #[cfg(target_os = "macos")]
+    let primary = Modifiers::SUPER;
+    #[cfg(not(target_os = "macos"))]
+    let primary = Modifiers::CONTROL;
+
     let mut builder = tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
-                .with_shortcut(Shortcut::new(Some(Modifiers::SUPER | Modifiers::SHIFT), Code::KeyH))
-                .unwrap()
-                .with_shortcut(Shortcut::new(Some(Modifiers::SUPER | Modifiers::SHIFT), Code::KeyS))
-                .unwrap()
-                .with_shortcut(Shortcut::new(Some(Modifiers::SUPER | Modifiers::SHIFT), Code::KeyQ))
-                .unwrap()
-                .with_shortcut(Shortcut::new(Some(Modifiers::SUPER | Modifiers::SHIFT), Code::Space))
-                .unwrap()
-                .with_shortcut(Shortcut::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyC))
-                .unwrap()
-                .with_shortcut(Shortcut::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyB))
-                .unwrap()
                 .with_handler(move |app, shortcut, event| {
                     // PTT shortcuts - Ctrl+Shift+C (computer), Ctrl+Shift+B (browser)
                     let ptt_mode: Option<&str> = if shortcut.matches(Modifiers::CONTROL | Modifiers::SHIFT, Code::KeyC) {
@@ -744,8 +770,8 @@ fn main() {
                         return;
                     }
 
-                    // Cmd+Shift+H - help mode (screenshot + prompt)
-                    if shortcut.matches(Modifiers::SUPER | Modifiers::SHIFT, Code::KeyH) {
+                    // Cmd+Shift+H (macOS) / Ctrl+Shift+H (elsewhere) - help mode
+                    if shortcut.matches(primary | Modifiers::SHIFT, Code::KeyH) {
                         let screenshot = panels::take_screenshot_excluding_app_sync().ok();
 
                         #[cfg(target_os = "macos")]
@@ -754,8 +780,8 @@ fn main() {
                         let _ = app.emit("hotkey-help", serde_json::json!({ "screenshot": screenshot }));
                     }
 
-                    // Cmd+Shift+Space - spotlight mode (show centered input)
-                    if shortcut.matches(Modifiers::SUPER | Modifiers::SHIFT, Code::Space) {
+                    // Cmd+Shift+Space (macOS) / Ctrl+Shift+Space (elsewhere) - spotlight mode
+                    if shortcut.matches(primary | Modifiers::SHIFT, Code::Space) {
                         println!("[taskhomie] Spotlight mode triggered");
                         let _ = app.emit("hotkey-spotlight", ());
 
@@ -770,16 +796,16 @@ fn main() {
                         }
                     }
 
-                    // Cmd+Shift+S - stop agent
-                    if shortcut.matches(Modifiers::SUPER | Modifiers::SHIFT, Code::KeyS) {
+                    // Cmd+Shift+S (macOS) / Ctrl+Shift+S (elsewhere) - stop agent
+                    if shortcut.matches(primary | Modifiers::SHIFT, Code::KeyS) {
                         if running_for_shortcut.load(std::sync::atomic::Ordering::SeqCst) {
                             running_for_shortcut.store(false, std::sync::atomic::Ordering::SeqCst);
                             println!("[taskhomie] Stop requested via shortcut");
                         }
                     }
 
-                    // Cmd+Shift+Q - quit app
-                    if shortcut.matches(Modifiers::SUPER | Modifiers::SHIFT, Code::KeyQ) {
+                    // Cmd+Shift+Q (macOS) / Ctrl+Shift+Q (elsewhere) - quit app
+                    if shortcut.matches(primary | Modifiers::SHIFT, Code::KeyQ) {
                         println!("[taskhomie] Quit requested via shortcut");
                         app.exit(0);
                     }
@@ -807,6 +833,28 @@ fn main() {
             current_session_id: std::sync::Mutex::new(0),
         })
         .setup(|app| {
+            // Register global shortcuts. Done manually (instead of via the builder's
+            // `with_shortcut`) so a single OS-reserved combo can never crash startup.
+            #[cfg(target_os = "macos")]
+            let primary = Modifiers::SUPER;
+            #[cfg(not(target_os = "macos"))]
+            let primary = Modifiers::CONTROL;
+
+            let sc = app.global_shortcut();
+            let shortcuts = [
+                Shortcut::new(Some(primary | Modifiers::SHIFT), Code::KeyH),
+                Shortcut::new(Some(primary | Modifiers::SHIFT), Code::KeyS),
+                Shortcut::new(Some(primary | Modifiers::SHIFT), Code::KeyQ),
+                Shortcut::new(Some(primary | Modifiers::SHIFT), Code::Space),
+                Shortcut::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyC),
+                Shortcut::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyB),
+            ];
+            for s in shortcuts {
+                if let Err(e) = sc.register(s) {
+                    println!("[taskhomie] shortcut unavailable (skipped): {}", e);
+                }
+            }
+
             // hide from dock - menubar app only
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
