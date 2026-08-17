@@ -1,7 +1,9 @@
 name: release
 
-# tag-driven. `git tag v0.1.1 && git push --tags` cuts a release.
+# tag-driven. `git tag vX.Y.Z && git push --tags` cuts a release.
 # also runnable by hand from the Actions tab.
+# Builds native bundles for Windows, macOS and Linux and attaches them
+# to a single GitHub release.
 on:
   push:
     tags:
@@ -17,8 +19,19 @@ permissions:
 
 jobs:
   build:
-    # macos-14 is apple silicon. the universal target covers intel too.
-    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-latest
+            args: ""
+          # macos-latest is apple silicon; the universal target also covers intel
+          - platform: macos-latest
+            args: --target universal-apple-darwin
+          - platform: ubuntu-22.04
+            args: ""
+
+    runs-on: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v4
 
@@ -27,9 +40,27 @@ jobs:
           node-version: 20
           cache: npm
 
-      - uses: dtolnay/rust-toolchain@stable
+      - name: install Rust toolchain (macOS)
+        if: matrix.platform == 'macos-latest'
+        uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: install Rust toolchain
+        if: matrix.platform != 'macos-latest'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: install Linux build dependencies
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            librsvg2-dev \
+            patchelf \
+            libssl-dev \
+            libayatana-appindicator3-dev
 
       - uses: swatinem/rust-cache@v2
         with:
@@ -40,8 +71,8 @@ jobs:
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # signing + notarization. if these secrets are absent the build still
-          # succeeds, it just produces an unsigned bundle that gatekeeper blocks.
+          # macOS signing + notarization. if these secrets are absent the build
+          # still succeeds, it just produces an unsigned bundle that gatekeeper blocks.
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
@@ -52,12 +83,19 @@ jobs:
           tagName: ${{ github.event.inputs.tag || github.ref_name }}
           releaseName: taskhomie ${{ github.event.inputs.tag || github.ref_name }}
           releaseBody: |
-            Download the `.dmg` below, drag taskhomie to Applications.
+            ## taskhomie ${{ github.event.inputs.tag || github.ref_name }}
 
-            On first launch macOS asks for Accessibility permission:
-            System Settings → Privacy & Security → Accessibility.
+            Native builds for every platform:
 
-            You supply your own Anthropic API key in the app.
+            - **Windows** — `taskhomie_*_x64-setup.exe` (or `.msi`). Run the installer.
+            - **macOS** — `taskhomie_*_universal.dmg`. Drag taskhomie to Applications.
+              On first launch grant Accessibility in System Settings → Privacy & Security.
+            - **Linux** — `.deb` / `.AppImage` / `.rpm`.
+
+            ### API key
+            The app ships without keys. Open **Settings** (tray → settings) and add the
+            key for the provider you picked (e.g. `OPENCODE_ZEN_API_KEY`, `ANTHROPIC_API_KEY`,
+            `OPENROUTER_API_KEY`, ...). Keys are stored locally in a `.env` next to the app.
           releaseDraft: true
           prerelease: false
-          args: --target universal-apple-darwin
+          args: ${{ matrix.args }}
