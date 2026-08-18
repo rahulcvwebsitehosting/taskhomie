@@ -70,6 +70,7 @@ jobs:
             libpipewire-0.3-dev \
             libpulse-dev \
             libasound2-dev \
+            libgbm-dev \
             libxdo-dev
 
       - uses: swatinem/rust-cache@v2
