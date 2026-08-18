@@ -63,6 +63,7 @@ jobs:
             libayatana-appindicator3-dev \
             libpipewire-0.3-dev \
             libpulse-dev \
+            libasound2-dev \
             libxdo-dev
 
       - uses: swatinem/rust-cache@v2
