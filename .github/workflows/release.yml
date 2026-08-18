@@ -17,6 +17,12 @@ on:
 permissions:
   contents: write
 
+# serialize the matrix jobs so they don't hammer the GitHub release API
+# (3 concurrent uploads to the same release can trigger transient 503s)
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   build:
     strategy:
